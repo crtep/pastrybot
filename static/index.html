@@ -273,6 +273,7 @@ const audibleNow = function audibleNow() {
 
 const join = async function join() {
   applying = true;
+  getAudioContext().resume(); // iOS suspends audio in background tabs
   const s = scheduler();
   if (s.started) s.stop();
   live = null; armed = null; tempoChange = null; playingId = null;
@@ -477,6 +478,10 @@ const start = async function start() {
 // The first press starts listening (browsers only allow sound after an interaction, unless
 // they allow autoplay); after that it mutes and unmutes this browser.
 $('sound').onclick = () => {
+  // iOS: play as music, so the ring/silent switch doesn't mute it (Safari 17+), and resume the
+  // audio context synchronously inside the tap, or iOS won't let it make sound
+  if (navigator.audioSession) navigator.audioSession.type = 'playback';
+  getAudioContext().resume();
   if (!started) {
     start();
     return;
