@@ -24,7 +24,7 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--body); }
-  body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr auto auto; }
+  body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr auto; }
   /* one centered column; everything hangs from its left edge */
   .col { width: min(var(--col), 100% - 48px); margin-inline: auto; }
 
@@ -51,7 +51,11 @@
   #error-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
   /* what the model is listening to: the Wikipedia article */
-  .listening { padding: 24px 0 20px; border-top: 1px solid var(--rule); }
+  /* the article and footer take at most a third of the screen (dvh: the visible height on
+     mobile, as toolbars come and go); a long article scrolls inside it */
+  .bottom { display: flex; flex-direction: column; max-height: 33.33vh; max-height: 33.33dvh; }
+  .listening { flex: 0 1 auto; min-height: 0; overflow-y: auto; padding: 24px 0 20px; border-top: 1px solid var(--rule); }
+  .bottom footer { flex: none; }
   footer { padding-bottom: 24px; font: 400 12px/1.5 var(--mono); color: var(--dim); }
   footer a { color: inherit; text-decoration: underline; text-decoration-color: var(--rule); text-underline-offset: 3px; }
   footer a:hover { color: var(--accent); text-decoration-color: currentColor; }
@@ -82,6 +86,9 @@
 
   /* the editor: no gutter, no box, just code on the page */
   #code .cm-editor { background: transparent !important; }
+  /* Strudel wraps each line's text in an inline-styled span with a translucent white background and
+     a slight invert (for legibility over its visuals); WebKit shows it as a band behind every line */
+  #code .cm-line > span[style*="background-color"] { background: none !important; filter: none !important; }
   /* Strudel's editor starts in its dark default theme (with "// LOADING") before we switch it
      to Solarized light: keep its container transparent, and hidden until it's set up */
   #code > div:not(#writing) { background: transparent !important; }
@@ -98,11 +105,11 @@
   #code .cm-line [style*="outline"] { outline: none !important; background: rgba(203, 75, 22, .16); border-radius: 2px; }
 
   /* thin rounded scrollbars in Solarized tones */
-  main, .cm-scroller { scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
-  main::-webkit-scrollbar, .cm-scroller::-webkit-scrollbar { width: 10px; height: 10px; }
-  main::-webkit-scrollbar-track, .cm-scroller::-webkit-scrollbar-track { background: transparent; }
-  main::-webkit-scrollbar-thumb, .cm-scroller::-webkit-scrollbar-thumb { background: var(--rule); border: 3px solid var(--bg); border-radius: 999px; }
-  main::-webkit-scrollbar-thumb:hover, .cm-scroller::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+  main, .cm-scroller, .listening { scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+  main::-webkit-scrollbar, .cm-scroller::-webkit-scrollbar, .listening::-webkit-scrollbar { width: 10px; height: 10px; }
+  main::-webkit-scrollbar-track, .cm-scroller::-webkit-scrollbar-track, .listening::-webkit-scrollbar-track { background: transparent; }
+  main::-webkit-scrollbar-thumb, .cm-scroller::-webkit-scrollbar-thumb, .listening::-webkit-scrollbar-thumb { background: var(--rule); border: 3px solid var(--bg); border-radius: 999px; }
+  main::-webkit-scrollbar-thumb:hover, .cm-scroller::-webkit-scrollbar-thumb:hover, .listening::-webkit-scrollbar-thumb:hover { background: var(--dim); }
 </style>
 </head>
 <body>
@@ -118,10 +125,12 @@
   <div id="error" hidden><span id="error-text"></span></div>
 </div>
 <main class="col" id="code"><div id="writing" aria-live="polite"><span id="writing-text"></span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div><strudel-editor id="repl"></strudel-editor></main>
+<div class="bottom">
 <section class="col listening">
   <p id="article" class="waiting">Waiting for the first article…</p>
 </section>
 <footer class="col">app by <a href="https://crtep.com">Carter Teplica</a> (and Opus 5.5) · <a href="https://github.com/crtep/pastrybot">source</a> · made with <a href="https://strudel.cc">Strudel</a></footer>
+</div>
 
 <script>
 // Every top-level name here is a const: Strudel copies its own functions (evaluate, start, ...)
