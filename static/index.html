@@ -44,7 +44,6 @@
   #progress { flex: 1; height: 1px; background: var(--rule); }
   #progress > div { height: 1px; width: 0; background: var(--dim); }
   #progress.ready > div { background: var(--accent); }
-  #time { flex: none; font: 400 12px/1 var(--mono); color: var(--dim); font-variant-numeric: tabular-nums; }
 
   #error { display: flex; gap: 12px; align-items: baseline; margin-top: 14px; font: 400 13px/1.5 var(--mono); color: var(--red); }
   #error[hidden] { display: none; }
@@ -121,7 +120,7 @@
       <svg class="on" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>
     </button>
   </header>
-  <div class="timeline"><div id="progress"><div></div></div><span id="time">0:00</span></div>
+  <div class="timeline"><div id="progress"><div></div></div></div>
   <div id="error" hidden><span id="error-text"></span></div>
 </div>
 <main class="col" id="code"><div id="writing" aria-live="polite"><span id="writing-text"></span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div><strudel-editor id="repl"></strudel-editor></main>
@@ -150,7 +149,6 @@ const clientId = crypto.randomUUID();
 let station = null;       // the latest /api/sync response
 let started = false;      // pressed play (or the browser allowed autoplay)
 let muted = false;        // silences this browser only; the station keeps going
-let listenStart = null;   // ms, for the small timer
 
 // Clock sync: the offset from this browser's clock to the server's, from the sample with the
 // shortest round trip (least uncertainty) among recent ones.
@@ -442,20 +440,14 @@ const renderArticle = function renderArticle(article, upcoming) {
   }
 }
 
-const fmtElapsed = function fmtElapsed(s) {
-  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
-  return `${m}:${String(sec).padStart(2, '0')}`;
-}
-
 // Every animation frame: the progress through the current 30 s (straight from the synced clock),
-// the listening timer, and the speaker icon.
+// and the speaker icon.
 const draw = function draw() {
   if (station) {
     const fraction = (serverNow() % turnSeconds()) / turnSeconds();
     $('progress').firstElementChild.style.width = `${fraction * 100}%`;
     $('progress').className = nextVersion() ? 'ready' : '';
   }
-  $('time').textContent = fmtElapsed(listenStart === null ? 0 : (Date.now() - listenStart) / 1000);
   document.body.classList.toggle('audible', started && !muted);
   $('sound').setAttribute('aria-label', !started ? 'Start' : muted ? 'Unmute' : 'Mute');
   applyMute();
@@ -479,7 +471,6 @@ const makeReadOnly = function makeReadOnly(root) {
 
 const start = async function start() {
   started = true;
-  listenStart = Date.now();
   log('listening');
   await join();
 }
