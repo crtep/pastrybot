@@ -1,12 +1,22 @@
-"""Serve the Strudel page and give a memoryless model one turn at the code per request."""
+"""pastrybot: one always-on station where a memoryless model livecodes Strudel.
+
+The music is a single shared version of the code. Turns are aligned to clock time (every
+:00 and :30). Five seconds into a turn, if anyone is listening, the model is shown the
+playing code and writes the next version, which every listener's browser swaps in on the
+next mark, beat-synced. With nobody listening, no model calls are made and the code stays.
+"""
 
 import argparse
 import asyncio
+import json
 import os
 import re
+import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import anthropic
 import httpx
@@ -17,42 +27,52 @@ from pydantic import BaseModel
 
 ROOT = Path(__file__).parent
 SYSTEM_PROMPT = (ROOT / "system_prompt.md").read_text()
+STATE_FILE = ROOT / "state.json"
 ANTHROPIC_OUTPUT_FORMAT = "\n\n# Output format\n\nPut the complete code in the `code` field, with no markdown fences."
 OPENROUTER_OUTPUT_FORMAT = (
     "\n\n# Output format\n\nReply with the complete code in exactly one ```js fenced code block. "
     "Put nothing else outside it: no explanation before or after."
 )
-INSPIRATION_EVERY_N_TURNS = 6  # turn 1, then every 3 minutes at 30s per turn
+
+TURN_SECONDS = 30
+REQUEST_DELAY_SECONDS = 5  # into a turn before asking for the next version, so first errors come in
+SAFETY_SECONDS = 8  # a version must be ready this long before a mark to start on it (clients poll every 2 s)
+LISTENER_TTL_SECONDS = 12  # a listening heartbeat keeps someone counted as listening this long
+VERSIONS_SENT = 3  # the live version, the next scheduled one, and what played before
+INSPIRATION_EVERY_N_TURNS = 6  # a new Wikipedia article every 3 minutes, on the clock
 PREVIEW_TURNS = 2  # the upcoming article is previewed on this many turns before it arrives
+MAX_REPORTED_ERRORS = 10
+MAX_ERROR_CHARS = 300
+# The model is told the time of day here (it's never told where, and the page never shows it).
+LOCAL_TIME_ZONE = ZoneInfo("America/Los_Angeles")
 
 
 class ModelInfo(BaseModel):
     id: str  # Anthropic model ID, or "openrouter:<OpenRouter model ID>"
     name: str
     provider: Literal["anthropic", "openrouter"]
-    input_price: float  # $ per million tokens
-    output_price: float
     supports_effort: bool  # Anthropic effort / OpenRouter reasoning effort
     max_tokens: int
 
 
 # Claude models go direct to Anthropic. Haiku 4.5 rejects the effort parameter (400).
-ANTHROPIC_MODELS: list[ModelInfo] = [
-    ModelInfo(id=i, name=n, provider="anthropic", input_price=a, output_price=b, supports_effort=e, max_tokens=16000)
-    for i, n, a, b, e in [
-        ("claude-fable-5-1", "Claude Fable 5.1", 10, 50, True),
-        ("claude-opus-5-5", "Claude Opus 5.5", 4, 20, True),
-        ("claude-opus-5", "Claude Opus 5", 5, 25, True),
-        ("claude-sonnet-5", "Claude Sonnet 5", 2, 10, True),
-        ("claude-haiku-4-5", "Claude Haiku 4.5", 1, 5, False),
+ANTHROPIC_MODELS: dict[str, ModelInfo] = {
+    i: ModelInfo(id=i, name=n, provider="anthropic", supports_effort=e, max_tokens=16000)
+    for i, n, e in [
+        ("claude-fable-5-1", "Claude Fable 5.1", True),
+        ("claude-opus-5-5", "Claude Opus 5.5", True),
+        ("claude-opus-5", "Claude Opus 5", True),
+        ("claude-sonnet-5", "Claude Sonnet 5", True),
+        ("claude-haiku-4-5", "Claude Haiku 4.5", False),
     ]
-]
+}
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_PREFIX = "openrouter:"
 FENCED_CODE = re.compile(r"```[a-zA-Z]*\n(.*?)```", re.DOTALL)
 WIKIPEDIA_RANDOM_URL = "https://en.wikipedia.org/api/rest_v1/page/random/summary"
 WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+USER_AGENT = "pastrybot/0.1 (+https://crtep.com)"
 MAX_ARTICLE_ROLLS = 10
 # Articles about a specific piece of music or a musical artist are rerolled (they'd hand the
 # model the answer). Wikidata says: an instance of (a subclass of) musical work, an instance
@@ -64,16 +84,6 @@ IS_MUSIC_QUERY = """ASK {{
 }}"""
 
 
-class TurnRequest(BaseModel):
-    model: str
-    code: str
-    turn: int
-    elapsed_seconds: float
-    eval_error: str | None
-    runtime_errors: list[str]
-    previous_runtime_errors: list[str]
-
-
 class Article(BaseModel):
     title: str
     extract: str
@@ -81,27 +91,23 @@ class Article(BaseModel):
     url: str
 
 
+class Version(BaseModel):
+    id: int
+    start_turn: int  # starts at start_turn * TURN_SECONDS (Unix time)
+    code: str
+    model: str
+    output_tokens: int
+    # what listeners' browsers reported while it played
+    eval_error: str | None = None
+    runtime_errors: list[str] = []
+
+
 class TurnOutput(BaseModel):
     code: str
 
 
-class TurnResponse(BaseModel):
-    code: str
-    article: Article | None
-    upcoming: Article | None
-    input_tokens: int
-    output_tokens: int
-
-
-class Config(BaseModel):
-    interval_seconds: float
-    model: str
-    models: list[ModelInfo]
-
-
 class Reply(BaseModel):
     code: str
-    input_tokens: int
     output_tokens: int
 
 
@@ -109,17 +115,54 @@ class ModelReplyError(Exception):
     """The model answered, but not with usable code."""
 
 
-def format_elapsed(seconds: float) -> str:
-    minutes, secs = divmod(int(seconds), 60)
-    return f"{minutes}m {secs:02d}s"
+class Report(BaseModel):
+    version_id: int
+    eval_error: str | None
+    runtime_errors: list[str]
+
+
+class SyncRequest(BaseModel):
+    client_id: str
+    listening: bool  # pressed play, not muted, tab visible
+    reports: list[Report]  # what this browser saw while evaluating/playing each version
+
+
+class Writing(BaseModel):
+    model: str
+    active: bool  # writing right now; otherwise this is the last finished version's author
+    output_tokens: int | None
+
+
+class SyncResponse(BaseModel):
+    server_time: float
+    turn_seconds: int
+    versions: list[Version]  # oldest first; the page plays the newest that has started
+    writing: Writing | None
+    article: Article | None  # the article in effect for the current turn
+    upcoming: Article | None  # previewed in the turns before it arrives
+    error: str | None  # the last model call's error, until one succeeds
 
 
 def is_inspiration_turn(turn: int) -> bool:
-    return (turn - 1) % INSPIRATION_EVERY_N_TURNS == 0
+    return turn % INSPIRATION_EVERY_N_TURNS == 0
+
+
+def inspiration_turn_for(turn: int) -> int:
+    return turn - turn % INSPIRATION_EVERY_N_TURNS
 
 
 def next_inspiration_turn_after(turn: int) -> int:
-    return turn + INSPIRATION_EVERY_N_TURNS - (turn - 1) % INSPIRATION_EVERY_N_TURNS
+    return inspiration_turn_for(turn) + INSPIRATION_EVERY_N_TURNS
+
+
+def local_time_phrase(unix_time: float) -> str:
+    t = datetime.fromtimestamp(unix_time, LOCAL_TIME_ZONE)
+    return f"It's {t.strftime('%I:%M:%S').lstrip('0')} {t.strftime('%p').lower()}."
+
+
+def clean_report(text: str) -> str:
+    """Error text comes from anyone's browser and ends up in the prompt: keep it short and plain."""
+    return re.sub(r"\s+", " ", text).strip()[:MAX_ERROR_CHARS]
 
 
 async def is_about_music(http: httpx.AsyncClient, wikidata_id: str) -> bool:
@@ -151,31 +194,21 @@ async def fetch_random_article(http: httpx.AsyncClient) -> Article:
     raise RuntimeError(f"{MAX_ARTICLE_ROLLS} random Wikipedia articles in a row were about music or unverifiable")
 
 
-async def fetch_openrouter_models(http: httpx.AsyncClient) -> list[ModelInfo]:
+async def fetch_openrouter_model(http: httpx.AsyncClient, model_id: str) -> ModelInfo:
     response = await http.get(OPENROUTER_MODELS_URL)
     response.raise_for_status()
-    models: list[ModelInfo] = []
+    wanted = model_id.removeprefix(OPENROUTER_PREFIX)
     for m in response.json()["data"]:
-        input_price = float(m["pricing"]["prompt"]) * 1e6
-        output_price = float(m["pricing"]["completion"]) * 1e6
-        # Skip routers with variable pricing (-1), batch-only variants, and Claude (used directly).
-        if input_price < 0 or m["id"].endswith(":batch") or m["id"].startswith("anthropic/"):
-            continue
-        if "text" not in m["architecture"]["output_modalities"]:
-            continue
-        max_completion = m["top_provider"]["max_completion_tokens"]
-        models.append(
-            ModelInfo(
-                id=OPENROUTER_PREFIX + m["id"],
+        if m["id"] == wanted:
+            max_completion = m["top_provider"]["max_completion_tokens"]
+            return ModelInfo(
+                id=model_id,
                 name=m["name"],
                 provider="openrouter",
-                input_price=input_price,
-                output_price=output_price,
                 supports_effort="reasoning" in m["supported_parameters"],
                 max_tokens=min(16000, max_completion) if max_completion else 16000,
             )
-        )
-    return sorted(models, key=lambda m: m.name.lower())
+    raise RuntimeError(f"OpenRouter has no model {wanted!r}")
 
 
 async def call_anthropic(
@@ -193,11 +226,7 @@ async def call_anthropic(
         raise ModelReplyError(f"Unexpected stop_reason {response.stop_reason!r}: {response.stop_details}")
     if response.parsed_output is None:
         raise ModelReplyError("Claude returned no parsed output")
-    return Reply(
-        code=response.parsed_output.code,
-        input_tokens=response.usage.input_tokens,
-        output_tokens=response.usage.output_tokens,
-    )
+    return Reply(code=response.parsed_output.code, output_tokens=response.usage.output_tokens)
 
 
 async def call_openrouter(http: httpx.AsyncClient, model: ModelInfo, effort: str, user_message: str) -> Reply:
@@ -231,152 +260,258 @@ async def call_openrouter(http: httpx.AsyncClient, model: ModelInfo, effort: str
     blocks = FENCED_CODE.findall(content)
     if len(blocks) != 1:
         raise ModelReplyError(f"Expected exactly one fenced code block, found {len(blocks)}. Reply:\n{content}")
-    return Reply(
-        code=blocks[0].strip(),
-        input_tokens=data["usage"]["prompt_tokens"],
-        output_tokens=data["usage"]["completion_tokens"],
-    )
+    return Reply(code=blocks[0].strip(), output_tokens=data["usage"]["completion_tokens"])
 
 
-def build_user_message(req: TurnRequest, article: Article | None, upcoming: Article | None) -> str:
-    parts: list[str] = [
-        f"Set time: {format_elapsed(req.elapsed_seconds)} elapsed. This is turn {req.turn}.",
-    ]
+def build_user_message(
+    live: Version | None, previous: Version | None, target_turn: int, article: Article | None, upcoming: Article | None
+) -> str:
+    parts: list[str] = [local_time_phrase(target_turn * TURN_SECONDS)]
     if article is not None:
         parts.append(
             f"Here is a random Wikipedia article for inspiration:\n\n# {article.title}\n\n{article.extract}"
         )
     if upcoming is not None:
-        turns_away = next_inspiration_turn_after(req.turn) - req.turn
+        turns_away = next_inspiration_turn_after(target_turn) - target_turn
         when = "next turn" if turns_away == 1 else f"in {turns_away} turns"
         parts.append(
             f"Preview: this is the next random Wikipedia article for inspiration. It arrives {when}, "
             "when you'll see it again. You may start steering the music toward it now, if you want "
             f"the transition to feel gradual:\n\n# {upcoming.title}\n\n{upcoming.extract}"
         )
-    if req.code.strip() == "":
+    if live is None or live.code.strip() == "":
         parts.append("The editor is empty. You are opening the set.")
     else:
-        parts.append(f"Current code in the editor:\n\n```js\n{req.code}\n```")
-    if req.eval_error is not None:
-        parts.append(
-            "This code FAILED to evaluate, so the audience is still hearing the previous "
-            f"version (which you can't see). Error:\n{req.eval_error}"
-        )
-    if req.runtime_errors:
-        joined = "\n".join(f"- {e}" for e in req.runtime_errors)
-        parts.append(f"Errors/warnings logged in the first seconds of this code playing:\n{joined}")
-    if req.previous_runtime_errors:
-        joined = "\n".join(f"- {e}" for e in req.previous_runtime_errors)
-        parts.append(
-            "Errors/warnings logged while the PREVIOUS version played. The current code may already "
-            f"have fixed them; check whether the sound or pattern responsible is still there:\n{joined}"
-        )
+        parts.append(f"Current code in the editor:\n\n```js\n{live.code}\n```")
+        if live.eval_error is not None:
+            parts.append(
+                "This code FAILED to evaluate, so listeners are still hearing the previous "
+                f"version (which you can't see). Error:\n{live.eval_error}"
+            )
+        if live.runtime_errors:
+            joined = "\n".join(f"- {e}" for e in live.runtime_errors)
+            parts.append(f"Errors/warnings logged in the first seconds of this code playing:\n{joined}")
+    if previous is not None:
+        earlier = [e for e in previous.runtime_errors if live is None or e not in live.runtime_errors]
+        if earlier:
+            joined = "\n".join(f"- {e}" for e in earlier)
+            parts.append(
+                "Errors/warnings logged while the PREVIOUS version played. The current code may already "
+                f"have fixed them; check whether the sound or pattern responsible is still there:\n{joined}"
+            )
     parts.append("What do you want to play next?")
     return "\n\n".join(parts)
 
 
-def make_app(client: anthropic.AsyncAnthropic, model: str, effort: str, interval: float) -> FastAPI:
+class Station:
+    """The single shared performance: versions of the code, listeners, and the model calls."""
+
+    def __init__(self, client: anthropic.AsyncAnthropic, model: ModelInfo, effort: str) -> None:
+        self.client = client
+        self.model = model
+        self.effort = effort
+        self.http = httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=10.0)
+        self.openrouter = httpx.AsyncClient(timeout=30.0)
+        self.versions: list[Version] = self.load()
+        self.listeners: dict[str, float] = {}  # client id -> last time it said it was listening
+        self.writing = False
+        self.error: str | None = None
+        # articles keyed by the inspiration turn they belong to; fetches are shared while in flight
+        self.articles: dict[int, asyncio.Task[Article]] = {}
+
+    # ---- persistence: the music survives restarts
+    def load(self) -> list[Version]:
+        if not STATE_FILE.exists():
+            return []
+        return [Version.model_validate(v) for v in json.loads(STATE_FILE.read_text())["versions"]]
+
+    def save(self) -> None:
+        STATE_FILE.write_text(json.dumps({"versions": [v.model_dump() for v in self.versions]}, indent=1))
+
+    # ---- versions
+    def live_version(self, turn: int) -> Version | None:
+        started = [v for v in self.versions if v.start_turn <= turn]
+        return started[-1] if started else None
+
+    def scheduled_after(self, turn: int) -> Version | None:
+        upcoming = [v for v in self.versions if v.start_turn > turn]
+        return upcoming[0] if upcoming else None
+
+    def add_version(self, version: Version) -> None:
+        self.versions.append(version)
+        # keep the live one, anything scheduled, and one before the live one (for its errors)
+        live = self.live_version(int(time.time() // TURN_SECONDS))
+        if live is not None:
+            keep_from = max(0, self.versions.index(live) - 1)
+            self.versions = self.versions[keep_from:]
+        self.save()
+
+    # ---- articles
+    async def article_for(self, inspiration_turn: int) -> Article:
+        task = self.articles.get(inspiration_turn)
+        if task is None:
+            task = self.articles[inspiration_turn] = asyncio.create_task(fetch_random_article(self.http))
+            for stale in [t for t in self.articles if t < inspiration_turn - INSPIRATION_EVERY_N_TURNS]:
+                del self.articles[stale]
+        try:
+            return await task
+        except Exception:
+            if self.articles.get(inspiration_turn) is task:
+                del self.articles[inspiration_turn]  # let the next request fetch again
+            raise
+
+    def peek_article(self, inspiration_turn: int) -> Article | None:
+        """For the page: the article if it's ready; otherwise start fetching it and show nothing yet."""
+        task = self.articles.get(inspiration_turn)
+        if task is None:
+            asyncio.create_task(self.article_for(inspiration_turn))
+            return None
+        if task.done() and task.exception() is None:
+            return task.result()
+        return None
+
+    # ---- listeners and reports
+    def sync(self, req: SyncRequest) -> SyncResponse:
+        now = time.time()
+        if req.listening:
+            self.listeners[req.client_id] = now
+        for stale in [c for c, t in self.listeners.items() if now - t > LISTENER_TTL_SECONDS]:
+            del self.listeners[stale]
+        for report in req.reports[:VERSIONS_SENT]:
+            reported = next((v for v in self.versions if v.id == report.version_id), None)
+            if reported is None:
+                continue
+            if report.eval_error is not None and reported.eval_error is None:
+                reported.eval_error = clean_report(report.eval_error)
+            for e in report.runtime_errors[:MAX_REPORTED_ERRORS]:
+                e = clean_report(e)
+                if e and e not in reported.runtime_errors and len(reported.runtime_errors) < MAX_REPORTED_ERRORS:
+                    reported.runtime_errors.append(e)
+
+        turn = int(now // TURN_SECONDS)
+        live = self.live_version(turn)
+        start = max(0, self.versions.index(live) - 1) if live is not None else 0
+        latest = self.versions[-1] if self.versions else None
+        next_inspiration = next_inspiration_turn_after(turn)
+        return SyncResponse(
+            server_time=now,
+            turn_seconds=TURN_SECONDS,
+            versions=self.versions[start:][-VERSIONS_SENT:],
+            writing=Writing(model=self.model.id, active=True, output_tokens=None) if self.writing
+            else Writing(model=latest.model, active=False, output_tokens=latest.output_tokens) if latest
+            else None,
+            article=self.peek_article(inspiration_turn_for(turn)),
+            upcoming=self.peek_article(next_inspiration) if next_inspiration - turn <= PREVIEW_TURNS else None,
+            error=self.error,
+        )
+
+    def someone_listening_since(self, since: float) -> bool:
+        return any(t >= since for t in self.listeners.values())
+
+    # ---- the conductor: at most one model call per turn, and only if someone is listening
+    async def conduct(self) -> None:
+        called_in_turn: int | None = None
+        while True:
+            await asyncio.sleep(0.5)
+            now = time.time()
+            turn = int(now // TURN_SECONDS)
+            into_turn = now - turn * TURN_SECONDS
+            if (
+                called_in_turn != turn
+                and into_turn >= REQUEST_DELAY_SECONDS
+                and not self.writing
+                and self.scheduled_after(turn) is None  # the next version isn't already written
+                and self.someone_listening_since(turn * TURN_SECONDS)
+            ):
+                called_in_turn = turn
+                asyncio.create_task(self.write_next_version(turn))
+
+    async def write_next_version(self, turn: int) -> None:
+        self.writing = True
+        try:
+            target_turn = turn + 1
+            live = self.live_version(turn)
+            previous = self.versions[self.versions.index(live) - 1] if live and self.versions.index(live) > 0 else None
+            article = await self.article_for(target_turn) if is_inspiration_turn(target_turn) else None
+            next_inspiration = next_inspiration_turn_after(target_turn)
+            upcoming = (
+                await self.article_for(next_inspiration) if next_inspiration - target_turn <= PREVIEW_TURNS else None
+            )
+            user_message = build_user_message(live, previous, target_turn, article, upcoming)
+            print(f"\n=== writing for {datetime.fromtimestamp(target_turn * TURN_SECONDS):%H:%M:%S} ===\n{user_message}\n")
+            if self.model.provider == "anthropic":
+                reply = await call_anthropic(self.client, self.model, self.effort, user_message)
+            else:
+                reply = await call_openrouter(self.openrouter, self.model, self.effort, user_message)
+            # start on the first mark far enough away for every listener's browser to have it
+            start_turn = target_turn
+            while start_turn * TURN_SECONDS - time.time() < SAFETY_SECONDS:
+                start_turn += 1
+            if start_turn != target_turn:
+                print(f"(arrived late; starts a turn later than planned)")
+            self.add_version(
+                Version(
+                    id=(self.versions[-1].id + 1) if self.versions else 1,
+                    start_turn=start_turn,
+                    code=reply.code,
+                    model=self.model.id,
+                    output_tokens=reply.output_tokens,
+                )
+            )
+            self.error = None
+            print(f"--- new code (starts {datetime.fromtimestamp(start_turn * TURN_SECONDS):%H:%M:%S}) ---\n{reply.code}\n")
+        except Exception as exc:
+            traceback.print_exception(exc)
+            self.error = f"{type(exc).__name__}: {exc}"[:500]
+        finally:
+            self.writing = False
+
+
+def make_app(station: Station) -> FastAPI:
     app = FastAPI()
 
-    # Show the actual error text on the page instead of a bare "Internal Server Error".
+    @app.on_event("startup")
+    async def start_conducting() -> None:
+        asyncio.create_task(station.conduct())
+
+    # Show the actual error text instead of a bare "Internal Server Error".
     @app.exception_handler(Exception)
     async def show_errors(_request: Request, exc: Exception) -> PlainTextResponse:
         traceback.print_exception(exc)
         return PlainTextResponse(f"{type(exc).__name__}: {exc}", status_code=500)
-    # Wikipedia asks API clients to identify themselves; the random endpoint redirects to the article.
-    http = httpx.AsyncClient(
-        headers={"User-Agent": "pastrybot/0.1 (+https://crtep.com)"},
-        follow_redirects=True,
-        timeout=10.0,
-    )
-
-    # Articles chosen ahead of time, keyed by the inspiration turn they belong to, so the
-    # page on load, the preview turns and the inspiration turn (and any retry of it) all see
-    # the same one. Fetches are cached while in flight, so concurrent requests share one.
-    articles: dict[int, asyncio.Task[Article]] = {}
-    openrouter = httpx.AsyncClient(timeout=30.0)
-    models_by_id: dict[str, ModelInfo] = {m.id: m for m in ANTHROPIC_MODELS}
-    openrouter_loaded = False
-
-    async def all_models() -> list[ModelInfo]:
-        nonlocal openrouter_loaded
-        if not openrouter_loaded:
-            models_by_id.update({m.id: m for m in await fetch_openrouter_models(openrouter)})
-            openrouter_loaded = True
-        return list(models_by_id.values())
-
-    async def article_for(inspiration_turn: int) -> Article:
-        task = articles.get(inspiration_turn)
-        if task is None:
-            task = articles[inspiration_turn] = asyncio.create_task(fetch_random_article(http))
-        try:
-            return await task
-        except Exception:
-            if articles.get(inspiration_turn) is task:
-                del articles[inspiration_turn]  # let a retry fetch again
-            raise
 
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(ROOT / "static" / "index.html")
 
-    @app.get("/api/config")
-    async def config() -> Config:
-        return Config(interval_seconds=interval, model=model, models=await all_models())
-
-    # A page load starts a new set. Wikipedia's random endpoint can take ~2 s, so one opening
-    # article is always fetched in advance: hand it out and start fetching the next.
-    spare_opening: list[asyncio.Task[Article]] = []
-
-    @app.get("/api/opening-article")
-    async def opening_article() -> Article:
-        articles.clear()
-        if not spare_opening:
-            spare_opening.append(asyncio.create_task(fetch_random_article(http)))
-        articles[1] = spare_opening.pop()
-        spare_opening.append(asyncio.create_task(fetch_random_article(http)))
-        return await article_for(1)
-
-    @app.post("/api/turn")
-    async def turn(req: TurnRequest) -> TurnResponse:
-        for stale in [t for t in articles if t < req.turn]:
-            del articles[stale]
-        article = await article_for(req.turn) if is_inspiration_turn(req.turn) else None
-        next_turn = next_inspiration_turn_after(req.turn)
-        upcoming = await article_for(next_turn) if next_turn - req.turn <= PREVIEW_TURNS else None
-        user_message = build_user_message(req, article, upcoming)
-        print(f"\n=== turn {req.turn} ===\n{user_message}\n")
-        await all_models()
-        model_info = models_by_id[req.model]
-        print(f"(model: {model_info.id})")
-        if model_info.provider == "anthropic":
-            reply = await call_anthropic(client, model_info, effort, user_message)
-        else:
-            reply = await call_openrouter(openrouter, model_info, effort, user_message)
-        print(f"--- new code ---\n{reply.code}\n")
-        return TurnResponse(
-            code=reply.code,
-            article=article,
-            upcoming=upcoming,
-            input_tokens=reply.input_tokens,
-            output_tokens=reply.output_tokens,
-        )
+    @app.post("/api/sync")
+    async def sync(req: SyncRequest) -> SyncResponse:
+        return station.sync(req)
 
     return app
 
 
+async def resolve_model(model_id: str) -> ModelInfo:
+    if model_id in ANTHROPIC_MODELS:
+        return ANTHROPIC_MODELS[model_id]
+    if model_id.startswith(OPENROUTER_PREFIX):
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            return await fetch_openrouter_model(http, model_id)
+    raise SystemExit(f"Unknown model {model_id!r}: use an Anthropic ID ({', '.join(ANTHROPIC_MODELS)}) or openrouter:<id>")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="openrouter:openai/gpt-6-luna", help="initial model (Anthropic ID or openrouter:<id>); switchable on the page")
+    parser.add_argument("--model", default="openrouter:openai/gpt-6-luna", help="Anthropic model ID or openrouter:<id>")
     parser.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"], help="ignored for models without effort/reasoning")
-    parser.add_argument("--interval", type=float, default=30.0, help="seconds between Claude turns")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    app = make_app(anthropic.AsyncAnthropic(), args.model, args.effort, args.interval)
-    print(f"Open http://localhost:{args.port}  (model={args.model}, effort={args.effort}, every {args.interval}s)")
-    uvicorn.run(app, host="127.0.0.1", port=args.port)
+    model = asyncio.run(resolve_model(args.model))
+    station = Station(anthropic.AsyncAnthropic(), model, args.effort)
+    print(f"pastrybot on http://{args.host}:{args.port}  (model={model.id}, effort={args.effort})")
+    uvicorn.run(make_app(station), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

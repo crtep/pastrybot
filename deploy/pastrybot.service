@@ -1,0 +1,17 @@
+[Unit]
+Description=pastrybot: a memoryless model livecoding Strudel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=carter
+WorkingDirectory=/home/carter/pastrybot
+# OPENROUTER_API_KEY (and/or ANTHROPIC_API_KEY) lives here, readable only by carter
+EnvironmentFile=/home/carter/pastrybot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/carter/pastrybot/.venv/bin/python server.py --port 8650
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -6,3 +6,4 @@ key.txt
 .venv/
 __pycache__/
 *.pyc
+state.json
