@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pastrybot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400..600&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<!-- deferred so the page (and the first article) shows before the 2 MB bundle arrives -->
+<script defer src="https://unpkg.com/@strudel/repl@1.3.0"></script>
+<style>
+  /* Solarized light: https://ethanschoonover.com/solarized/ */
+  :root {
+    --base03: #002b36; --base02: #073642; --base01: #586e75; --base00: #657b83;
+    --base0: #839496; --base1: #93a1a1; --base2: #eee8d5; --base3: #fdf6e3;
+    --orange: #cb4b16; --red: #dc322f;
+
+    --bg: var(--base3); --rule: var(--base2);
+    --text: var(--base01); --body: var(--base00); --dim: var(--base1);
+    --accent: var(--orange);
+    --mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+    --serif: Newsreader, Georgia, serif;
+    --col: 760px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--body); }
+  body { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr auto auto; }
+  /* one centered column; everything hangs from its left edge */
+  .col { width: min(var(--col), 100% - 48px); margin-inline: auto; }
+
+  header { display: flex; align-items: center; gap: 16px; padding-top: 36px; }
+  h1 {
+    margin: 0; font: 500 26px/1 var(--mono); letter-spacing: -.02em; color: var(--text);
+    text-box: trim-both ex alphabetic; /* trim to the x-height, so centring aligns with the lowercase letters */
+  }
+  #sound { margin-left: auto; flex: none; display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; background: none; color: var(--text); cursor: pointer; }
+  #sound:hover:not(:disabled) { color: var(--accent); }
+  #sound:disabled { opacity: .35; cursor: default; }
+  #sound svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  #sound .on, body.audible #sound .off { display: none; }
+  body.audible #sound .on { display: block; }
+
+  .timeline { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
+  #progress { flex: 1; height: 1px; background: var(--rule); }
+  #progress > div { height: 1px; width: 0; background: var(--dim); }
+  #progress.ready > div { background: var(--accent); }
+  #time { flex: none; font: 400 12px/1 var(--mono); color: var(--dim); font-variant-numeric: tabular-nums; }
+
+  #error { display: flex; gap: 12px; align-items: baseline; margin-top: 14px; font: 400 13px/1.5 var(--mono); color: var(--red); }
+  #error[hidden] { display: none; }
+  #error-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #retry { flex: none; font: inherit; padding: 0; border: 0; background: none; color: var(--red); text-decoration: underline; cursor: pointer; }
+
+  /* what the model is listening to: the Wikipedia article */
+  .listening { padding: 24px 0 20px; border-top: 1px solid var(--rule); }
+  footer { padding-bottom: 24px; font: 400 12px/1.5 var(--mono); color: var(--dim); }
+  footer a { color: inherit; text-decoration: underline; text-decoration-color: var(--rule); text-underline-offset: 3px; }
+  footer a:hover { color: var(--accent); text-decoration-color: currentColor; }
+  #article {
+    margin: 0; font: 400 16px/1.55 var(--serif); color: var(--body);
+    /* plain greedy wrapping: appending "Up next…" never re-breaks the lines before it */
+    text-wrap: wrap; text-align: left; hyphens: manual;
+  }
+  #article a { color: var(--text); font-style: italic; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-color: var(--dim); }
+  #article a:hover { color: var(--accent); text-decoration-color: currentColor; }
+  #article .next { font-style: italic; color: var(--dim); }
+  #article .next a { color: var(--dim); }
+  #article.waiting { font-style: italic; color: var(--dim); }
+
+  /* 6px of margin (not padding) at each end keeps the scrollbar clear of the rules above and below */
+  main { min-width: 0; overflow: auto; margin-block: 6px; padding: 30px 0 26px; }
+  /* always the first line above the code, read as a comment:
+     "// gpt-6-luna is writing..." then "// gpt-6-luna wrote 1238 tokens" */
+  #writing { font: 400 15px/1.75 var(--mono); color: var(--base1); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+  #writing .dots { display: none; }
+  body.writing #writing .dots { display: inline; }
+  /* a slow, soft wave through the dots: each fades up and down in turn */
+  #writing .dots span { opacity: .2; animation: wave 2.4s ease-in-out infinite; }
+  #writing .dots span:nth-child(2) { animation-delay: .3s; }
+  #writing .dots span:nth-child(3) { animation-delay: .6s; }
+  @keyframes wave { 0%, 60%, 100% { opacity: .2; } 30% { opacity: 1; } }
+  @media (max-width: 640px) { #writing { font-size: 13px; } }
+
+  /* the editor: no gutter, no box, just code on the page */
+  #code .cm-editor { background: transparent !important; }
+  /* Strudel's editor starts in its dark default theme (with "// LOADING") before we switch it
+     to Solarized light: keep its container transparent, and hidden until it's set up */
+  #code > div:not(#writing) { background: transparent !important; }
+  #code:not(.ready) > div:not(#writing) { visibility: hidden; }
+  #code .cm-gutters { display: none !important; }
+  #code .cm-content { padding: 0; }
+  #code .cm-line { padding: 0; line-height: 1.75; }
+  #code .cm-activeLine { background: transparent; }
+  #code .cm-focused { outline: none; }
+  /* read-only: no caret (the model's changes arrive through setCode, not typing) */
+  #code .cm-content { caret-color: transparent; }
+  #code .cm-cursorLayer { display: none; }
+  /* playing notes: Strudel draws a 2px inline-style outline; a soft accent tint instead */
+  #code .cm-line [style*="outline"] { outline: none !important; background: rgba(203, 75, 22, .16); border-radius: 2px; }
+
+  /* thin rounded scrollbars in Solarized tones */
+  main, .cm-scroller { scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+  main::-webkit-scrollbar, .cm-scroller::-webkit-scrollbar { width: 10px; height: 10px; }
+  main::-webkit-scrollbar-track, .cm-scroller::-webkit-scrollbar-track { background: transparent; }
+  main::-webkit-scrollbar-thumb, .cm-scroller::-webkit-scrollbar-thumb { background: var(--rule); border: 3px solid var(--bg); border-radius: 999px; }
+  main::-webkit-scrollbar-thumb:hover, .cm-scroller::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+</style>
+</head>
+<body>
+<div class="col">
+  <header>
+    <h1>pastrybot</h1>
+    <button id="sound" disabled aria-label="Start">
+      <svg class="off" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>
+      <svg class="on" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>
+    </button>
+  </header>
+  <div class="timeline"><div id="progress"><div></div></div><span id="time">0:00</span></div>
+  <div id="error" hidden><span id="error-text"></span><button id="retry">retry</button></div>
+</div>
+<main class="col" id="code"><div id="writing" aria-live="polite"><span id="writing-text"></span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div><strudel-editor id="repl"></strudel-editor></main>
+<section class="col listening">
+  <p id="article" class="waiting">Waiting for the first article…</p>
+</section>
+<footer class="col">app by <a href="https://crtep.com">Carter Teplica</a> (and Opus 5.5) · <a href="https://github.com/crtep/pastrybot">source</a> · made with <a href="https://strudel.cc">Strudel</a></footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const repl = $('repl');
+// A page load starts a new set; ask for its first article before anything else.
+const openingArticle = fetch('/api/opening-article');
+
+let config;               // {interval_seconds, model, models}
+let turn = 0;             // number of the latest request (one ahead of what's playing)
+
+// The set clock (shown on screen and sent to the model) starts when the music does.
+let started = false;
+let clockRunStart = null; // wall-clock ms when the music started
+const clockMs = () => (clockRunStart === null ? 0 : Date.now() - clockRunStart);
+
+// Mute silences the output; the music, the clock and the model all keep going.
+let muted = false;
+
+let thinking = false;     // a model call is in flight
+let failed = false;       // last model call failed; loop halted until retry
+let failMessage = null;
+let pending = null;       // the model's response, waiting for its mark
+let applying = false;     // evaluating code ahead of a mark
+let musicStarted = false; // the scheduler has been started by a first successful apply
+let runtimeErrors = [];   // strudel log errors since the current code went live
+let previousRuntimeErrors = []; // everything the previous version logged while it played
+let lastEvalError = null;
+
+// Changes land on a grid of "marks" exactly interval_seconds apart, measured on
+// Strudel's cycle clock. Code is evaluated LEAD_SECONDS before its mark and spliced
+// in so the old pattern plays right up to the mark.
+const LEAD_SECONDS = 1.0;
+const MIN_LEAD_SECONDS = 0.3; // any closer and the scheduler may already have queried past the mark
+let nextMarkCycle = null; // cycle of the next mark; null = first version plays on arrival
+let armed = null;         // evaluated code waiting for its mark: {cycle, turn, ...}
+let tempoChange = null;   // {cycle, cps}: new code's setcps/setcpm, deferred to its mark
+// Wait this long into each new version before asking for the next one, so errors
+// from its first seconds of playing (e.g. a missing sound) make it into the request.
+const REQUEST_DELAY_SECONDS = 5;
+let requestAtCycle = null;
+const scheduler = () => repl.editor.repl.scheduler;
+
+const modelsById = new Map();
+const modelLabel = (id) => modelsById.get(id).name;
+// "openrouter:openai/gpt-6-luna" -> "gpt-6-luna"; Claude IDs are already short
+const modelId = (id) => id.replace(/^openrouter:/, '').split('/').pop();
+let inFlightModel = null;
+let lastWrote = null;     // {model, tokens} of the most recent finished response
+
+function fmtElapsed(s) {
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+// Events go to the browser console; failures also show under the timeline.
+function log(text, level = 'info') {
+  const t = started ? fmtElapsed(clockMs() / 1000) : '--:--';
+  (level === 'err' ? console.warn : console.info)(`[${t}] ${text}`);
+}
+
+// Collect runtime errors Strudel logs while a pattern is playing (e.g. unknown sounds).
+document.addEventListener('strudel.log', (e) => {
+  const { message, type } = e.detail;
+  if (type === 'error' || /error|not found/i.test(message)) {
+    if (message.startsWith('[eval]')) return; // eval errors are reported separately
+    if (!runtimeErrors.includes(message) && runtimeErrors.length < 10) {
+      runtimeErrors.push(message);
+      log(message, 'err');
+    }
+  }
+});
+
+// Evaluate code now. With a boundary cycle, keep the old pattern for haps before the
+// boundary and the new one from it on, and hold any tempo change until the boundary.
+// Returns the tempo (cps) that will be in effect after the boundary.
+async function applyCode(code, boundary) {
+  const editor = repl.editor;
+  const s = scheduler();
+  // state.pattern is the last successfully evaluated pattern (never our spliced one)
+  const oldPattern = boundary === null ? null : editor.repl.state.pattern;
+  const oldCps = s.cps;
+
+  editor.setCode(code);
+  await editor.evaluate();
+  const newCps = s.cps;
+
+  const err = editor.repl.state.evalError;
+  if (err) {
+    if (newCps !== oldCps) s.setCps(oldCps);
+    lastEvalError = String(err.message ?? err);
+    log(`turn ${turn} eval error: ${lastEvalError}`, 'err');
+    return oldCps;
+  }
+  lastEvalError = null;
+  musicStarted = true;
+  if (boundary === null) return newCps;
+
+  if (newCps !== oldCps) {
+    s.setCps(oldCps);
+    tempoChange = { cycle: boundary, cps: newCps };
+  }
+  const newPattern = editor.repl.state.pattern;
+  const onsetBefore = (h) => h.whole && Number(h.whole.begin) < boundary;
+  await s.setPattern(
+    oldPattern.filterHaps(onsetBefore).stack(newPattern.filterHaps((h) => !onsetBefore(h))),
+  );
+  return newCps;
+}
+
+function fail(message) {
+  thinking = false;
+  applying = false;
+  failed = true;
+  failMessage = message;
+  log(`${message}. Stopped; press retry.`, 'err');
+}
+
+// Surface anything unexpected, and halt the loop so it's noticed.
+window.addEventListener('unhandledrejection', (e) => fail(`error: ${e.reason?.stack ?? e.reason}`));
+
+// Timeline: code goes live on a mark -> wait a few seconds -> request the next version
+// -> hold the response -> evaluate it just before the next mark -> live exactly on the mark.
+async function requestTurn() {
+  thinking = true;
+  failed = false;
+  turn += 1;
+  const myTurn = turn;
+  const model = config.model;
+  inFlightModel = model;
+
+  const body = {
+    model,
+    code: repl.editor.editor.state.doc.toString(),
+    turn: myTurn,
+    elapsed_seconds: clockMs() / 1000,
+    eval_error: lastEvalError,
+    runtime_errors: runtimeErrors,
+    previous_runtime_errors: previousRuntimeErrors.filter((e) => !runtimeErrors.includes(e)),
+  };
+  const t0 = performance.now();
+  let res;
+  try {
+    res = await fetch('/api/turn', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    turn -= 1;
+    fail(`turn ${myTurn} failed: ${err} (is the server running?)`);
+    return;
+  }
+  const seconds = ((performance.now() - t0) / 1000).toFixed(1);
+  if (!res.ok) {
+    turn -= 1;
+    fail(`turn ${myTurn} failed (HTTP ${res.status}): ${await res.text()}`);
+    return;
+  }
+  const data = await res.json();
+  thinking = false;
+  lastWrote = { model, tokens: data.output_tokens };
+  pending = {
+    turn: myTurn, model, code: data.code, article: data.article, upcoming: data.upcoming,
+    seconds, outputTokens: data.output_tokens, late: false,
+  };
+  // before the music starts, show the opening right away (it plays when the speaker is pressed);
+  // later versions appear when they go live, so the code on screen matches what you hear
+  if (!musicStarted) repl.editor.setCode(data.code);
+  tick();
+}
+
+// Evaluate the pending code ahead of its mark (or right away for the first version).
+async function arm(markCycle) {
+  const p = pending;
+  pending = null;
+  applying = true;
+  const cps = await applyCode(p.code, markCycle);
+  applying = false;
+  if (markCycle === null) {
+    if (!musicStarted) {
+      // the opening failed to evaluate and nothing is playing yet: ask again right away
+      requestTurn();
+      return;
+    }
+    markCycle = 0; // the scheduler just started from cycle 0
+    clockRunStart = Date.now();
+    log('music started');
+  }
+  armed = { ...p, cycle: markCycle };
+  nextMarkCycle = markCycle + cps * config.interval_seconds;
+}
+
+// ---- the article: Wikipedia's intro, with its subject (bold in Wikipedia's HTML) as the link
+let article = null;
+let upcoming = null;
+
+function renderArticle() {
+  const p = $('article');
+  p.classList.remove('waiting');
+  p.replaceChildren();
+  const link = (text, url) => Object.assign(document.createElement('a'), { textContent: text, href: url, target: '_blank', rel: 'noopener' });
+
+  // Rebuild the text from Wikipedia's extract_html, keeping only words; the first <b>
+  // (the article's subject as it appears in the sentence) becomes the link.
+  const doc = new DOMParser().parseFromString(article.extract_html, 'text/html');
+  let linked = false;
+  const walk = (node) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) p.append(child.textContent.replace(/\s+/g, ' '));
+      else if (child.nodeName === 'B' && !linked) { p.append(link(child.textContent, article.url)); linked = true; }
+      else walk(child);
+    }
+  };
+  walk(doc.body);
+  // No bolded subject in the extract (rare): lead with the title so there's still a link.
+  if (!linked) p.prepend(link(article.title, article.url), ': ');
+  p.normalize();
+  p.firstChild.textContent = p.firstChild.textContent.trimStart();
+  p.lastChild.textContent = p.lastChild.textContent.trimEnd();
+
+  if (upcoming) {
+    const next = document.createElement('span');
+    next.className = 'next';
+    next.append('Up next: ', link(upcoming.title, upcoming.url), '.');
+    p.append(' ', next);
+  }
+}
+
+function goLive(a) {
+  previousRuntimeErrors = runtimeErrors;
+  runtimeErrors = [];
+  if (a.article) article = a.article;
+  if (a.article || a.upcoming !== upcoming) {
+    upcoming = a.upcoming;
+    if (article) renderArticle();
+  }
+  if (a.article) log(`inspiration: ${a.article.title}`);
+  log(`turn ${a.turn} live · ${modelLabel(a.model)} took ${a.seconds}s · ${a.outputTokens} output tokens${a.late ? ' · waited a mark' : ''}`);
+  requestAtCycle = a.cycle + scheduler().cps * REQUEST_DELAY_SECONDS;
+}
+
+const secondsUntil = (cycle) => (cycle - scheduler().now()) / scheduler().cps;
+
+function tick() {
+  if (started && !applying) {
+    const s = scheduler();
+    if (tempoChange && s.lastEnd >= tempoChange.cycle) {
+      s.setCps(tempoChange.cps);
+      tempoChange = null;
+    }
+    if (armed && s.now() >= armed.cycle) {
+      const a = armed;
+      armed = null;
+      goLive(a);
+    }
+    if (requestAtCycle !== null && s.now() >= requestAtCycle) {
+      requestAtCycle = null;
+      requestTurn();
+    }
+    if (nextMarkCycle === null) {
+      if (pending) arm(null);
+    } else if (!armed) {
+      // too close to (or past) the next mark to make it: the grid moves on without us
+      while (secondsUntil(nextMarkCycle) < MIN_LEAD_SECONDS) {
+        nextMarkCycle += s.cps * config.interval_seconds;
+        if (pending && !pending.late) {
+          pending.late = true;
+          log(`turn ${pending.turn} arrived too late for its mark; it waits for the next one`, 'err');
+        } else if (thinking) {
+          log(`${modelLabel(config.model)} is still thinking at the mark; the current code plays another ${config.interval_seconds}s`, 'err');
+        }
+      }
+      if (pending && secondsUntil(nextMarkCycle) <= LEAD_SECONDS) arm(nextMarkCycle);
+    }
+  }
+  applyMute();
+  render();
+}
+
+// Strudel's master output gain. Strudel can rebuild this node (e.g. when effects reset),
+// so the mute is re-applied to whichever node is current on every tick.
+function applyMute() {
+  if (!musicStarted) return;
+  const gain = getSuperdoughAudioController().output.destinationGain;
+  const target = muted ? 0 : 1;
+  if (gain.__target === target) return;
+  gain.gain.setTargetAtTime(target, gain.context.currentTime, 0.02);
+  gain.__target = target;
+}
+
+function render() {
+  // errors show even before the music starts (the opening is requested on page load)
+  $('error').hidden = !failed;
+  if (failed) $('error-text').textContent = `Model call failed: ${failMessage}`;
+  document.body.classList.toggle('writing', thinking);
+  if (config) {
+    const name = modelId(inFlightModel ?? config.model);
+    $('writing-text').textContent = thinking ? `// ${name} is writing`
+      : failed ? `// ${name} didn't finish writing`
+      : lastWrote ? `// ${modelId(lastWrote.model)} wrote ${lastWrote.tokens} tokens`
+      : '';
+  }
+  if (!started) return;
+  document.body.classList.toggle('audible', !muted);
+  $('sound').setAttribute('aria-label', muted ? 'Unmute' : 'Mute');
+  $('time').textContent = fmtElapsed(clockMs() / 1000);
+
+  $('progress').className = pending || armed ? 'ready' : '';
+}
+
+// Position within the current 30 s, straight from Strudel's clock, every animation frame.
+function drawProgress() {
+  const target = armed ? armed.cycle : nextMarkCycle;
+  const fraction = !started || !musicStarted || target === null
+    ? 0
+    : 1 - Math.max(0, secondsUntil(target)) / config.interval_seconds;
+  $('progress').firstElementChild.style.width = `${Math.min(100, Math.max(0, fraction * 100))}%`;
+  requestAnimationFrame(drawProgress);
+}
+
+setInterval(tick, 50);
+
+// The opening is requested as soon as the page loads. The music starts on the first press
+// of the speaker (browsers only allow sound after an interaction), or right away if the
+// browser allows autoplay. After that the button mutes and unmutes.
+function startMusic() {
+  started = true;
+  log(pending ? 'starting with the opening' : 'waiting for the opening');
+  tick();
+}
+
+$('sound').onclick = () => {
+  if (!started) {
+    startMusic();
+    return;
+  }
+  muted = !muted;
+  log(muted ? 'muted' : 'unmuted');
+  render();
+};
+
+$('retry').onclick = () => requestTurn();
+
+// Only the model writes the code. Strudel doesn't expose CodeMirror's read-only setting, so
+// stop edits (and Strudel's own shortcuts like Ctrl+Enter / Ctrl+.) before the editor sees
+// them. Selecting, copying and moving around still work.
+function makeReadOnly(root) {
+  const navigation = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End']);
+  const block = (e) => { e.preventDefault(); e.stopPropagation(); };
+  root.addEventListener('keydown', (e) => {
+    if (navigation.has(e.key)) return;
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && ['c', 'a'].includes(e.key.toLowerCase())) return; // copy, select all
+    if (e.key === 'Tab') { e.stopPropagation(); return; } // let Tab move focus instead of indenting
+    block(e);
+  }, true);
+  for (const type of ['beforeinput', 'paste', 'cut', 'drop']) root.addEventListener(type, block, true);
+}
+
+// Show the set's first article as soon as it arrives; the opening request (sent once the
+// editor exists) uses the same article. If it can't load, the opening request fetches it again.
+const articleShown = (async () => {
+  const res = await openingArticle;
+  if (!res.ok) {
+    log(`couldn't load the first article (HTTP ${res.status}): ${await res.text()}`, 'err');
+    return;
+  }
+  article = await res.json();
+  renderArticle();
+})();
+
+(async () => {
+  config = await (await fetch('/api/config')).json();
+  for (const m of config.models) modelsById.set(m.id, m);
+  // the web component creates its editor in a setTimeout after connecting
+  while (!repl.editor) await new Promise((r) => setTimeout(r, 50));
+  repl.editor.setCode('');
+  repl.editor.setFontFamily("'IBM Plex Mono', monospace");
+  const narrow = matchMedia('(max-width: 640px)');
+  const sizeCode = () => repl.editor.setFontSize(narrow.matches ? 13 : 15);
+  sizeCode();
+  narrow.onchange = sizeCode;
+  makeReadOnly($('code'));
+  repl.editor.setTheme('solarizedLight');
+  repl.editor.setLineWrappingEnabled(true);
+  $('code').classList.add('ready');
+  requestAnimationFrame(drawProgress);
+  await articleShown;
+  requestTurn();
+  await repl.editor.prebaked;
+  $('sound').disabled = false;
+  // autoplay: if the browser lets the audio context run without a click, just start
+  const ctx = getAudioContext();
+  await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 300))]);
+  if (ctx.state === 'running' && !started) startMusic();
+})();
+</script>
+</body>
+</html>
